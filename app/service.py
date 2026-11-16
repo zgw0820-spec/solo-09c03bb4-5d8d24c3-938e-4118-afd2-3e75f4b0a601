@@ -9,9 +9,16 @@ Invariants enforced inside every ``BEGIN IMMEDIATE`` SQLite transaction:
   the old replica is only removed in the same transaction that promotes the
   new replica. A service's ready count therefore never dips below
   ``min_ready``.
-* If there is no viable target, or the simulated start fails, the reservation
-  is released and the old replica keeps serving; the container is reported as
-  blocked.
+* Placement is planned for the whole batch at once, not one greedy replica at
+  a time. When a complete, capacity-respecting placement for every remaining
+  replica exists, all of them are reserved and shown together, so trial order
+  can never falsely report a replica as blocked. Only when no complete plan
+  exists do we fall back to a partial migration: the maximum number of
+  replicas that still fit is reserved, and every unplaced old replica keeps
+  serving and is reported as blocked.
+* If the simulated start fails, the reservation is released and the old
+  replica keeps serving; retries re-plan against the capacity available at
+  retry time, so capacity freed elsewhere is picked up on the next attempt.
 * Every mutation re-reads state under the write lock, so concurrent drains
   cannot double-book capacity. Nothing is rebuilt in memory at startup: an
   interrupted drain resumes from the persisted SQLite state.
@@ -19,6 +26,7 @@ Invariants enforced inside every ``BEGIN IMMEDIATE`` SQLite transaction:
 
 from __future__ import annotations
 
+import itertools
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -644,15 +652,10 @@ def _candidate_targets(
     return candidates
 
 
-def _schedule(conn: sqlite3.Connection, drain_id: int, node_id: str) -> None:
-    """Create one attempt per serving replica still on the drained node.
-
-    Ordering uses each service's headroom above ``min_ready``: services with
-    spare ready replicas are moved first, services that are exactly at their
-    minimum are moved last. This never stops a replica before its replacement
-    is ready, so the drain cannot pull a service below ``min_ready``; when
-    capacity is scarce the ordering just decides who gets it first.
-    """
+def _drainable_containers(
+    conn: sqlite3.Connection, node_id: str
+) -> list[sqlite3.Row]:
+    """Serving replicas on the drained node that do not have a starting twin."""
     ready_by_service: dict[str, int] = {
         row["service"]: row["n"]
         for row in conn.execute(
@@ -667,26 +670,118 @@ def _schedule(conn: sqlite3.Connection, drain_id: int, node_id: str) -> None:
             container["service"], 0
         )
 
-    containers = sorted(
-        _serving_containers(conn, node_id),
-        key=lambda c: (-surplus(c), -c["cpu_request"], c["position"], c["id"]),
-    )
-    for container in containers:
-        if conn.execute(
+    rows = [
+        container
+        for container in _serving_containers(conn, node_id)
+        if not conn.execute(
             "SELECT 1 FROM migrations WHERE container_id = ? AND state = 'starting'",
             (container["id"],),
-        ).fetchone():
-            # A replica is already starting for this container; its cutover
-            # will free the source slot when resolved.
-            continue
+        ).fetchone()
+    ]
+    # Services with spare ready replicas move first; services exactly at their
+    # minimum move last. Ties are broken by bigger requests and stable ids so
+    # every run produces the same partial plan.
+    return sorted(
+        rows,
+        key=lambda c: (-surplus(c), -c["cpu_request"], c["position"], c["id"]),
+    )
 
-        candidates = _candidate_targets(conn, node_id)
-        fitting = [
-            (node, free)
-            for node, free in candidates
-            if free >= container["cpu_request"]
-        ]
-        if not fitting:
+
+def _find_full_plan(
+    containers: list[sqlite3.Row],
+    candidates: list[tuple[sqlite3.Row, int]],
+) -> dict[str, str] | None:
+    """Place *every* replica at once via backtracking.
+
+    A greedy pass can strand a replica that would fit under a different
+    arrangement (e.g. requests 6/4/4 against free capacity 8/6), so the whole
+    batch is solved globally. The search order is deterministic; nodes with
+    equal remaining capacity are treated as interchangeable.
+    """
+    if not containers:
+        return {}
+    if not candidates:
+        return None
+
+    node_order = [node["id"] for node, _ in candidates]
+    free = {node["id"]: slack for node, slack in candidates}
+    # Largest-first ordering fails fastest and keeps the search tiny.
+    ordered = sorted(
+        containers,
+        key=lambda c: (-c["cpu_request"], c["position"], c["id"]),
+    )
+    assignment: dict[str, str] = {}
+
+    def backtrack(index: int) -> bool:
+        if index == len(ordered):
+            return True
+        container = ordered[index]
+        seen_slack: set[int] = set()
+        for node_id in node_order:
+            slack = free[node_id]
+            if slack < container["cpu_request"] or slack in seen_slack:
+                continue
+            seen_slack.add(slack)
+            free[node_id] = slack - container["cpu_request"]
+            assignment[container["id"]] = node_id
+            if backtrack(index + 1):
+                return True
+            free[node_id] = slack
+            del assignment[container["id"]]
+        return False
+
+    if backtrack(0):
+        return assignment
+    return None
+
+
+def _find_partial_plan(
+    containers: list[sqlite3.Row],
+    candidates: list[tuple[sqlite3.Row, int]],
+) -> dict[str, str]:
+    """Best-effort placement when no full plan exists.
+
+    Maximises the number of replicas that *can* move, and among plans of the
+    same size keeps the scheduler's priority order (most spare service
+    headroom, then biggest request). Everything left unplaced keeps serving on
+    the drained node and is reported as blocked. Feasibility of each candidate
+    subset is decided with the same backtracking solver as the full plan, so a
+    subset is never rejected merely because a greedy pass could not pack it.
+    """
+    if not containers or not candidates:
+        return {}
+
+    # ``combinations`` walks larger prefixes first, so the earliest accepted
+    # subset is the largest one that respects the priority ordering.
+    for size in range(len(containers), 0, -1):
+        for selection in itertools.combinations(containers, size):
+            plan = _find_full_plan(list(selection), candidates)
+            if plan is not None:
+                return plan
+    return {}
+
+
+def _schedule(conn: sqlite3.Connection, drain_id: int, node_id: str) -> None:
+    """Reserve target capacity for every movable replica on the drained node.
+
+    The whole batch is planned before any row is written: when a complete,
+    capacity-respecting placement exists, every replica is reserved at once
+    instead of reporting a blocked replica merely because of greedy trial
+    order. Only when no complete plan exists do we fall back to a partial
+    migration; the unplaced old replicas keep serving and become blocked.
+    """
+    containers = _drainable_containers(conn, node_id)
+    if not containers:
+        return
+
+    candidates = _candidate_targets(conn, node_id)
+    plan = _find_full_plan(containers, candidates)
+    if plan is None:
+        plan = _find_partial_plan(containers, candidates)
+
+    for container in containers:
+        target_id = plan.get(container["id"])
+        if target_id is None:
             if not candidates:
                 code = "NO_USABLE_TARGET"
                 message = (
@@ -699,8 +794,9 @@ def _schedule(conn: sqlite3.Connection, drain_id: int, node_id: str) -> None:
                 )
                 code = "INSUFFICIENT_CAPACITY"
                 message = (
-                    f"no target node has {container['cpu_request']} CPU free "
-                    f"({free_summary})"
+                    f"no complete placement exists; this replica needs "
+                    f"{container['cpu_request']} CPU ({free_summary}); the old "
+                    "replica keeps serving"
                 )
             _record_blocked(
                 conn,
@@ -713,7 +809,6 @@ def _schedule(conn: sqlite3.Connection, drain_id: int, node_id: str) -> None:
             )
             continue
 
-        target = fitting[0][0]
         now = utcnow()
         conn.execute(
             "INSERT INTO migrations "
@@ -724,7 +819,7 @@ def _schedule(conn: sqlite3.Connection, drain_id: int, node_id: str) -> None:
                 drain_id,
                 container["id"],
                 node_id,
-                target["id"],
+                target_id,
                 container["cpu_request"],
                 now,
                 now,

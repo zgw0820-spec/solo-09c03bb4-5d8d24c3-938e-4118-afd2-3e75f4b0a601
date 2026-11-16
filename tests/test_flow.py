@@ -494,6 +494,144 @@ def test_restart_keeps_reservations_and_pending(tmp_path):
         assert n2["reserved_cpu"] == 0
 
 
+def test_global_plan_places_full_batch_despite_greedy_order(tmp_path):
+    # The reported incident: requests 6/4/4 against free capacity 8/6.
+    # Greedy "emptiest first" would put the 6-CPU replica on the 8-CPU node
+    # and strand one 4-CPU replica; the planner must instead reserve all three
+    # (6 -> the 6-CPU node, the two 4s -> the 8-CPU node) in one batch.
+    client = make_client(tmp_path)
+    payload = topology(
+        nodes=[
+            {"id": "n1", "name": "source", "cpu_capacity": 16},
+            {"id": "n2", "name": "free8", "cpu_capacity": 8},
+            {"id": "n3", "name": "free6", "cpu_capacity": 6},
+        ],
+        containers=[
+            {"id": "c6", "service": "svc", "min_ready": 1, "node_id": "n1", "cpu_request": 6},
+            {"id": "c4a", "service": "svc", "min_ready": 1, "node_id": "n1", "cpu_request": 4},
+            {"id": "c4b", "service": "svc", "min_ready": 1, "node_id": "n1", "cpu_request": 4},
+        ],
+    )
+    with client:
+        client.post("/api/topology", json=payload)
+        state = client.post("/api/nodes/n1/drain").json()
+        drain = state["open_drains"][0]
+        targets = {
+            m["container_id"]: m["target_node_id"]
+            for m in drain["pending_decisions"]
+        }
+        assert len(drain["pending_decisions"]) == 3
+        assert targets == {"c6": "n3", "c4a": "n2", "c4b": "n2"}
+        assert state["blocked_containers"] == []
+        n2 = next(n for n in state["nodes"] if n["id"] == "n2")
+        n3 = next(n for n in state["nodes"] if n["id"] == "n3")
+        assert (n2["reserved_cpu"], n2["remaining_cpu"]) == (8, 0)
+        assert (n3["reserved_cpu"], n3["remaining_cpu"]) == (6, 0)
+        # Old replicas are untouched until cutover, so ready count holds.
+        assert next(s for s in state["services"] if s["name"] == "svc")["ready"] == 3
+
+        # After every new replica becomes ready the drain completes normally.
+        for migration in list(drain["pending_decisions"]):
+            state = client.post(
+                f"/api/migrations/{migration['id']}/resolve",
+                json={"outcome": "ready"},
+            ).json()
+        assert state["open_drains"] == []
+        n1 = next(n for n in state["nodes"] if n["id"] == "n1")
+        assert n1["is_empty"] is True
+        assert state["drains"][0]["moved"] == 3
+
+
+def test_partial_migration_when_no_complete_plan_exists(tmp_path):
+    # Three 4-CPU replicas, only 10 CPU of free capacity in total: no complete
+    # placement exists, so two replicas move and the third stays in service.
+    client = make_client(tmp_path)
+    payload = topology(
+        nodes=[
+            {"id": "n1", "cpu_capacity": 12},
+            {"id": "n2", "cpu_capacity": 6},
+            {"id": "n3", "cpu_capacity": 4},
+        ],
+        containers=[
+            {"id": "b1", "service": "s", "min_ready": 1, "node_id": "n1", "cpu_request": 4},
+            {"id": "b2", "service": "s", "min_ready": 1, "node_id": "n1", "cpu_request": 4},
+            {"id": "b3", "service": "s", "min_ready": 1, "node_id": "n1", "cpu_request": 4},
+        ],
+    )
+    with client:
+        client.post("/api/topology", json=payload)
+        state = client.post("/api/nodes/n1/drain").json()
+        drain = state["open_drains"][0]
+        assert len(drain["pending_decisions"]) == 2
+        assert [b["container_id"] for b in state["blocked_containers"]] == ["b3"]
+        n1 = next(n for n in state["nodes"] if n["id"] == "n1")
+        # Reservations never move the old replicas: all three still serve.
+        assert n1["serving_containers"] == 3
+        for node in state["nodes"]:
+            assert node["used_cpu"] <= node["cpu_capacity"]
+
+        # Cut the two reserved replicas over; the blocked one still serves and
+        # retrying without freed capacity keeps it blocked rather than failing.
+        for migration in list(drain["pending_decisions"]):
+            state = client.post(
+                f"/api/migrations/{migration['id']}/resolve",
+                json={"outcome": "ready"},
+            ).json()
+        assert state["open_drains"][0]["status"] == "incomplete"
+        state = client.post("/api/nodes/n1/resume").json()
+        assert [b["container_id"] for b in state["blocked_containers"]] == ["b3"]
+        assert state["blocked_containers"][0]["reason_code"] == "INSUFFICIENT_CAPACITY"
+        b3 = next(c for c in state["containers"] if c["id"] == "b3")
+        assert b3["node_id"] == "n1"
+
+
+def test_retry_replans_against_capacity_freed_elsewhere(tmp_path):
+    # A failed start releases its reservation; a later retry must re-plan
+    # against the capacity available at retry time, not the stale plan.
+    client = make_client(tmp_path)
+    payload = topology(
+        nodes=[
+            {"id": "n1", "cpu_capacity": 16},
+            {"id": "n2", "cpu_capacity": 8},
+            {"id": "n3", "cpu_capacity": 6},
+        ],
+        containers=[
+            {"id": "c6", "service": "svc", "min_ready": 1, "node_id": "n1", "cpu_request": 6},
+            {"id": "c4a", "service": "svc", "min_ready": 1, "node_id": "n1", "cpu_request": 4},
+            {"id": "c4b", "service": "svc", "min_ready": 1, "node_id": "n1", "cpu_request": 4},
+        ],
+    )
+    with client:
+        client.post("/api/topology", json=payload)
+        state = client.post("/api/nodes/n1/drain").json()
+        pending = state["open_drains"][0]["pending_decisions"]
+        c4a = next(m for m in pending if m["container_id"] == "c4a")
+        others = [m for m in pending if m["container_id"] != "c4a"]
+
+        # Fail c4a: its 4-CPU reservation on n2 is released.
+        state = client.post(
+            f"/api/migrations/{c4a['id']}/resolve", json={"outcome": "failed"}
+        ).json()
+        n2 = next(n for n in state["nodes"] if n["id"] == "n2")
+        assert n2["reserved_cpu"] == 4  # c4b's reservation survives
+        assert n2["remaining_cpu"] == 4
+
+        # Finish the other two cutovers so the drain becomes incomplete.
+        for migration in others:
+            state = client.post(
+                f"/api/migrations/{migration['id']}/resolve",
+                json={"outcome": "ready"},
+            ).json()
+        assert state["open_drains"][0]["status"] == "incomplete"
+
+        # Retry re-selects n2 using the 4 CPU that the failure freed.
+        state = client.post("/api/nodes/n1/resume").json()
+        retried = state["open_drains"][0]["pending_decisions"]
+        assert len(retried) == 1
+        assert retried[0]["container_id"] == "c4a"
+        assert retried[0]["target_node_id"] == "n2"
+
+
 def test_example_topology_endpoint_matches_file(tmp_path):
     client = make_client(tmp_path)
     with client:
